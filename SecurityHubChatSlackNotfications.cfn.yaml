@@ -30,7 +30,6 @@ Resources:
         ZipFile: |
           import boto3
           import json
-          import ipaddress
           import os
 
           def lambda_handler(event, context):
@@ -39,8 +38,6 @@ Resources:
             finding = event['detail']['findings'][0]
             findingArn = finding['Id']
             productArn = finding['ProductArn']
-            print(findingArn)
-            print(productArn)
 
             client = boto3.client('securityhub')
             snsTopic = os.environ['SNS_TOPIC_ARN']
