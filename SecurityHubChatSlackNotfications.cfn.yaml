@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  SlackWorkSpaceID:
+    Description: Slack workspace ID (Copy and Paste from AWS Chatbot Configured Clients Interface)
+    Type: String
+    MinLength: 9
+    MaxLength: 15
+    AllowedPattern: ^[a-zA-Z0-9_]*$
+    ConstraintDescription: |
+      Malformed Input Parameter: Environment must contain only upper and numbers. Length should be minimum of 9 characters and a maximum of 15 characters.
+ 
+  SlackChannelID:
+    Description: Slack Channel ID
+    Type: String
+    MinLength: 9
+    MaxLength: 15
+    AllowedPattern: ^[a-zA-Z0-9_]*$
+    ConstraintDescription: |
+      Malformed Input Parameter: Environment must contain only upper and numbers. Length should be a minimum of 9 characters and a maximum of 15 characters.
+Resources:
+  DeduplicatingNotificationLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Lambda which receives Security Hub Findings, checks if they have already been posted to a notification and if not notifies
+      FunctionName: SecurityHubNotifier
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityHubNotifierRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import ipaddress
+          import os
+
+          def lambda_handler(event, context):
+            print(event)
+  
+            finding = event['detail']['findings'][0]
+            findingArn = finding['Id']
+            productArn = finding['ProductArn']
+            print(findingArn)
+            print(productArn)
+
+            client = boto3.client('securityhub')
+            snsTopic = os.environ['SNS_TOPIC_ARN']
+            snsClient = boto3.client('sns')
+
+            # Check if this finding has already been notified to Slack and ignore if so
+            if 'UserDefinedFields' in finding and 'SentToSlack' in finding['UserDefinedFields'] and finding['UserDefinedFields']['SentToSlack'] == "True":
+              print("Finding already notified - not forwarding")
+              return None
+
+            snsClient.publish(
+              TopicArn=snsTopic,
+              MessageStructure='json',
+              Message=json.dumps({'default': json.dumps(event)}))
+    
+            result = client.batch_update_findings(FindingIdentifiers=[
+              {
+                'Id': findingArn,
+                'ProductArn': productArn
+              }],
+              UserDefinedFields={
+                'SentToSlack': 'True'
+              }
+            )
+
+            print(result)
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopicAWSChatBot
+      Tags:
+        - Key: Usage
+          Value: OrgCompliance
+  SecurityHubNotifierRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub >-
+                  arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/SecurityHubNotifier:*
+              - Effect: Allow
+                Action:
+                  - 'securityhub:BatchUpdateFindings'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: '*'
+      Tags:
+        - Key: Usage
+          Value: OrgCompliance
+  EventBridgeLambdaNotificationPermissions:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DeduplicatingNotificationLambda.Arn
+      Principal: events.amazonaws.com
+  SecurityHubNotificationsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Rule to pickup Security Hub Findings
+      Name: SecHubFindingsFilter
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            Severity:
+              Label:
+                - HIGH
+                - CRITICAL
+                - MEDIUM
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DeduplicatingNotificationLambda.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 4
+            MaximumEventAgeInSeconds: 400
+          Id: SecHubFindingFilterLambda
+  SNSTopicAWSChatBot:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWS Chatbot SNS Topic
+  EventTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: topicPolicyCustomaction
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: 'sns:Publish'
+          Resource: '*'
+      Topics:
+        - !Ref SNSTopicAWSChatBot
+  ChatBotManageIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "sns.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+  SlackChannelConfig:
+    Type: AWS::Chatbot::SlackChannelConfiguration
+    Properties: 
+      ConfigurationName: securityhubnotification
+      IamRoleArn: !GetAtt ChatBotManageIAMRole.Arn
+      LoggingLevel: NONE
+      SlackChannelId: !Ref SlackChannelID
+      SlackWorkspaceId: !Ref SlackWorkSpaceID
+      SnsTopicArns: 
+        - !Ref  SNSTopicAWSChatBot
+  
